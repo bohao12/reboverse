@@ -141,7 +141,14 @@ class ExplorationMap:
     OBSTACLE = 2
     HIT_THRESHOLD = 3   # how many consecutive hits before a cell is an obstacle
 
-    def __init__(self, resolution_m: float = 1.5, arena_m: float = 200.0):
+    def __init__(self, resolution_m: float = 1.0, arena_m: float = 80.0):
+        """
+        FIX: Reduced grid size dramatically.
+        - resolution: 1.0m (was 0.5m) → 4x fewer cells
+        - arena: 80m (was 200m) → 16x fewer cells
+        - Total: 80x80 = 6,400 cells (was 160,000!)
+        This makes visited region tracking visible (1% instead of 0.1%)
+        """
         self.res = resolution_m
         n_cells = int(arena_m / resolution_m)
         self._origin = n_cells // 2
@@ -150,6 +157,11 @@ class ExplorationMap:
         # Frontiers that repeatedly failed to reach → skip them
         self._blacklist: set[tuple[int, int]] = set()
         self._frontier_attempts: dict[tuple[int, int], int] = {}
+        # Track visited region centers to avoid re-exploring same area from different angles
+        self._visited_region_radius_m: float = 2.0  # 2m radius (matches larger grid cells)
+
+    def _idx_to_world(self, r: int, c: int) -> tuple[float, float]:
+        return (r - self._origin) * self.res, (c - self._origin) * self.res
 
     def _to_idx(self, north: float, east: float) -> tuple[int, int]:
         r = int(round(north / self.res)) + self._origin
@@ -159,32 +171,24 @@ class ExplorationMap:
         return r, c
 
     def mark_visited(self, north: float, east: float) -> None:
-        r_center, c_center = self._to_idx(north, east)
-        
-        # 🚨 THE FIX: Mark a 3x3 footprint to account for drift!
-        for dr in [-1, 0, 1]:
-            for dc in [-1, 0, 1]:
-                r = r_center + dr
-                c = c_center + dc
-                
-                # Boundary check so we don't crash the array
-                if 0 <= r < self._grid.shape[0] and 0 <= c < self._grid.shape[1]:
-                    if self._grid[r, c] != self.OBSTACLE:
-                        self._grid[r, c] = self.VISITED
-                        
-                        # Clear any false-positive hits in this wide path
-                        self._hits[r, c] = 0 
-                        self._blacklist.discard((r, c))
-
-    def mark_obstacle(self, north: float, east: float) -> None:
-        """
-        FIX BUG 7: increment hit counter; only promote to OBSTACLE after
-        HIT_THRESHOLD separate observations so doorframes aren't blocked.
-        """
+        # FIX: Only mark the single cell we are in so we don't accidentally wipe out nearby walls!
         r, c = self._to_idx(north, east)
-        if self._grid[r, c] == self.VISITED:
-            # Don't retroactively block cells the drone has already passed through
+        if self._grid[r, c] != self.OBSTACLE:
+            self._grid[r, c] = self.VISITED
+            self._blacklist.discard((r, c))
+
+    def mark_obstacle(self, north: float, east: float, force: bool = False) -> None:
+        r, c = self._to_idx(north, east)
+        # If we have safely passed through here, ignore false walls (unless forced)
+        if self._grid[r, c] == self.VISITED and not force:
             return
+            
+        # If we hit an emergency, skip the counter and map the wall INSTANTLY
+        if force:
+            self._grid[r, c] = self.OBSTACLE
+            return
+            
+        # Otherwise, use the hit counter to build confidence
         self._hits[r, c] = min(self._hits[r, c] + 1, 255)
         if self._hits[r, c] >= self.HIT_THRESHOLD:
             self._grid[r, c] = self.OBSTACLE
@@ -216,13 +220,15 @@ class ExplorationMap:
         north: float,
         east: float,
         current_heading_rad: float = 0.0,   # FIX BUG 4: pass in current heading
-    ) -> float | None:
+    ) -> tuple[float, tuple[int, int]] | None:
         """
         BFS to the nearest reachable UNKNOWN cell.
 
         FIX BUG 4: Neighbours are sorted by angular proximity to `current_heading_rad`
         so the drone prefers to continue forwards rather than reversing.
         Blacklisted frontiers are skipped.
+
+        Returns the heading and the frontier grid cell.
         """
         dr, dc = self._to_idx(north, east)
 
@@ -279,10 +285,36 @@ class ExplorationMap:
         if d_north == 0.0 and d_east == 0.0:
             return None
 
-        return math.atan2(d_east, d_north)
+        return math.atan2(d_east, d_north), target_frontier
 
     def visited_count(self) -> int:
         return int((self._grid == self.VISITED).sum())
+    
+    def grid_coverage_stats(self) -> dict[str, float]:
+        """Returns coverage statistics for debugging."""
+        visited = (self._grid == self.VISITED).sum()
+        unknown = (self._grid == self.UNKNOWN).sum()
+        obstacle = (self._grid == self.OBSTACLE).sum()
+        
+        # Only count non-obstacle cells for percentage
+        total_explorable = visited + unknown
+        if total_explorable == 0:
+            return {
+                "visited_pct": 0.0,
+                "unknown_pct": 0.0,
+                "total_visited_cells": 0,
+                "total_unknown_cells": 0,
+                "blacklisted_frontiers": len(self._blacklist),
+            }
+        
+        return {
+            "visited_pct": 100.0 * visited / total_explorable,
+            "unknown_pct": 100.0 * unknown / total_explorable,
+            "total_visited_cells": int(visited),
+            "total_unknown_cells": int(unknown),
+            "obstacle_pct": 100.0 * obstacle / self._grid.size if self._grid.size > 0 else 0.0,
+            "blacklisted_frontiers": len(self._blacklist),
+        }
 
 
 # ============================================================
@@ -364,7 +396,7 @@ class DroneNavigation:
     _LOOP_WINDOW          = 60    # frames to look back
     _LOOP_UNIQUE_CELLS    = 4     # fewer distinct cells → entering SCAN mode
     _SCAN_ROTATE_RATE     = 15.0  # deg/frame during scan
-    _SCAN_COMPLETE_DEG    = 370.0 # rotate slightly past 360
+    _SCAN_COMPLETE_DEG    = 480.0 # rotate 1.25 turns (450°) so drone doesn't face same obstacle
 
     def __init__(
         self,
@@ -403,7 +435,7 @@ class DroneNavigation:
             critical_distance=critical_distance,
             num_bins=72, min_gap_bins=2,
         )
-        self.exp_map     = ExplorationMap(resolution_m=1.2)
+        self.exp_map     = ExplorationMap(resolution_m=1.0, arena_m=80.0)
         self.alt_sweeper = AltitudeSweeper(altitudes_m=list(search_altitudes_m))
         self.detector    = ObjectDetector(model_path=model_path)
 
@@ -421,6 +453,15 @@ class DroneNavigation:
         self._last_frontier_north: float | None = None
         self._last_frontier_east:  float | None = None
         self._frames_at_frontier: int = 0
+
+        self._current_frontier: tuple[int, int] | None = None
+        self._previous_frontier: tuple[int, int] | None = None
+        self._frontier_stall_frames: int = 0
+        self._frontier_last_dist: float | None = None
+        
+        # Emergency backup state to prevent oscillation
+        self._emergency_backup_yaw: float | None = None
+        self._emergency_backup_frames: int = 0
 
     # ------------------------------------------------------------------
     #  Pose helpers
@@ -471,12 +512,18 @@ class DroneNavigation:
         Returns NED heading in degrees toward nearest reachable unexplored cell,
         aligned with the drone's current travel direction.
         """
-        heading_rad = self.exp_map.get_frontier_heading(
+        res = self.exp_map.get_frontier_heading(
             self.pose["north"],
             self.pose["east"],
             current_heading_rad=self.pose["yaw"],   # FIX BUG 4
         )
-        return math.degrees(heading_rad) if heading_rad is not None else None
+        if res is None:
+            self._current_frontier = None
+            return None
+
+        heading_rad, cell = res
+        self._current_frontier = cell
+        return math.degrees(heading_rad)
 
     # ------------------------------------------------------------------
     #  Anti-loop: check if we're cycling (FIX BUG 6)
@@ -566,12 +613,21 @@ class DroneNavigation:
                 blocked          = info["blocked"]
                 cl               = info["clearance"]
 
+                if center_clearance < 4.0:
+                    wall_n = north + center_clearance * math.cos(math.radians(actual_yaw))
+                    wall_e = east + center_clearance * math.sin(math.radians(actual_yaw))
+                    self.exp_map.mark_obstacle(wall_n, wall_e)
+                
+                # Get coverage stats for debugging
+                cov_stats = self.exp_map.grid_coverage_stats()
+
                 print(
                     f"[NAV] state={self._nav_state} blocked={blocked} | "
                     f"L={cl['left']:.1f} C={cl['center']:.1f} R={cl['right']:.1f} | "
                     f"hdg={info['preferred_heading_deg']:.0f}° | "
-                    f"alt={-target_down:.1f}m | visited={self.exp_map.visited_count()} | "
-                    f"remaining={len(self.targets_remaining)}"
+                    f"alt={-target_down:.1f}m | visited={cov_stats['visited_pct']:.1f}% ({cov_stats['total_visited_cells']}cells) | "
+                    f"unknown={cov_stats['unknown_pct']:.1f}% | blk_fr={cov_stats['blacklisted_frontiers']} | "
+                    f"tgt={len(self.targets_remaining)}"
                 )
 
                 # ── 7. SCAN MODE – rotate 360° when looping ──────────────
@@ -613,10 +669,15 @@ class DroneNavigation:
                         vfh_deg = actual_yaw
 
                     # FIX BUG 5: use BFS frontier UNLESS we are very close to an obstacle.
-                    # Original threshold was safe_distance (2.5 m) which was almost always
-                    # True inside a room.  Now we only disable BFS inside the critical zone.
-                    if center_clearance < self.planner.critical_distance * 2.0:
-                        # Close to obstacle – trust VFH only
+                    # IMPROVED: Only use VFH if VERY close (0.84m), otherwise prefer BFS frontier
+                    # But if we've visited most of the accessible area, use VFH to fill gaps
+                    exploration_complete = cov_stats['visited_pct'] > 60.0
+                    
+                    if center_clearance < self.planner.critical_distance * 1.2:
+                        # Very close to obstacle – trust VFH only
+                        target_yaw_deg = vfh_deg
+                    elif exploration_complete:
+                        # Already explored most cells, use VFH to search remaining gaps
                         target_yaw_deg = vfh_deg
                     else:
                         # Open space – use global map frontier
@@ -626,9 +687,41 @@ class DroneNavigation:
                         else:
                             target_yaw_deg = vfh_deg
 
+                if self._current_frontier is not None:
+                    frontier_n, frontier_e = self.exp_map._idx_to_world(*self._current_frontier)
+                    dist = math.hypot(frontier_n - north, frontier_e - east)
+
+                    if self._previous_frontier == self._current_frontier:
+                        # Check if we're getting closer or stuck
+                        if self._frontier_last_dist is not None:
+                            dist_delta = self._frontier_last_dist - dist
+                            # FIX: If distance isn't decreasing OR we're very close but not arriving
+                            # mark as stalled so we blacklist and find a new frontier
+                            if (dist_delta < 0.2) or (dist < 1.5 and dist_delta < 0.05):
+                                self._frontier_stall_frames += 1
+                            else:
+                                self._frontier_stall_frames = max(0, self._frontier_stall_frames - 1)
+                        else:
+                            self._frontier_stall_frames = 0
+                        self._frontier_last_dist = dist
+
+                        if self._frontier_stall_frames >= 10:
+                            print(f"[NAV] Stuck on frontier ({cov_stats['total_visited_cells']} visited); blacklisting ({frontier_n:.1f}, {frontier_e:.1f})")
+                            self.exp_map.record_frontier_attempt(frontier_n, frontier_e)
+                            self._current_frontier = None
+                            self._previous_frontier = None
+                            self._frontier_stall_frames = 0
+                            self._frontier_last_dist = None
+                            target_yaw_deg = vfh_deg
+                    else:
+                        self._previous_frontier = self._current_frontier
+                        self._frontier_stall_frames = 0
+                        self._frontier_last_dist = dist
+
                 # Anti-loop: enter SCAN mode if we appear to be circling (FIX BUG 6)
-                if self._check_loop(north, east):
-                    print("[NAV] Loop detected – entering SCAN mode")
+                # But only if we've been in EXPLORE mode for a while to avoid false triggers
+                if self._nav_state == _STATE_EXPLORE and self._check_loop(north, east):
+                    print(f"[NAV] Loop detected ({len(set(self._recent_cells))} unique cells in {self._LOOP_WINDOW} frames) – entering SCAN mode")
                     self._nav_state    = _STATE_SCAN
                     self._scan_start_yaw = actual_yaw
                     self._scan_rotated  = 0.0
@@ -647,21 +740,44 @@ class DroneNavigation:
                     mark_dist = center_clearance + 0.6
                     wall_n = north + mark_dist * math.cos(math.radians(actual_yaw))
                     wall_e = east  + mark_dist * math.sin(math.radians(actual_yaw))
-                    self.exp_map.mark_obstacle(wall_n, wall_e)
+                  
+                    self.exp_map.mark_obstacle(wall_n, wall_e, force=True) 
                     
                     forward_step = -0.5   # back up
-
-                elif yaw_error > 15.0:
-                    # 🚨 THE FIX: If we need to turn, STOP MOVING FORWARD.
-                    # Just hover in place and rotate until we face the clear path.
-                    forward_step = 0.0    
+                    self.exp_map.mark_obstacle(wall_n, wall_e)
+                    
+                    # FIX: Commit to a backup direction for multiple frames to avoid oscillation.
+                    # Only choose new direction if we weren't already backing up or if it's changed.
+                    if self._emergency_backup_yaw is None or self._emergency_backup_frames == 0:
+                        # Choose turn direction based on current clearance
+                        if cl["left"] > cl["right"]:
+                            self._emergency_backup_yaw = actual_yaw - 45.0
+                        else:
+                            self._emergency_backup_yaw = actual_yaw + 45.0
+                        self._emergency_backup_frames = 8  # Commit for 8 frames
+                    else:
+                        self._emergency_backup_frames -= 1
+                        # Continue with the chosen direction
+                    
+                    target_yaw_deg = self._emergency_backup_yaw
+                    forward_step = -0.3   # back up (slightly less aggressive)
 
                 else:
-                    # We are facing the correct, clear direction! Fly forward.
-                    if center_clearance < self.planner.safe_distance:
-                        forward_step = 1.2    # thread carefully
+                    # Not in emergency, clear the backup state
+                    self._emergency_backup_yaw = None
+                    self._emergency_backup_frames = 0
+                    
+                    if yaw_error > 15.0:
+                        # 🚨 THE FIX: If we need to turn, STOP MOVING FORWARD.
+                        # Just hover in place and rotate until we face the clear path.
+                        forward_step = 0.0    
+
                     else:
-                        forward_step = 2.0 # full cruise
+                        # We are facing the correct, clear direction! Fly forward.
+                        if center_clearance < self.planner.safe_distance:
+                            forward_step = 1.2    # thread carefully
+                        else:
+                            forward_step = 2.0 # full cruise
 
                 actual_yaw_rad = math.radians(actual_yaw)
                 n_target = north + forward_step * math.cos(actual_yaw_rad)
@@ -710,11 +826,11 @@ async def main() -> None:
         model_path        = "best.pt",  # (Make sure you are using your actual YOLO weights file here, like yolov10n.pt)
         depth_topic       = "/depth_camera",
         loop_hz           = 4.0,
-        step_size         = 1.0,  # Slightly smaller steps for tighter doorways
+        step_size         = 0.8,  # Smaller steps for tighter doorways
         
         # --- SHRINK THE SAFETY BUBBLE ---
-        safe_distance     = 3.5,  
-        critical_distance = 1.0,  
+        safe_distance     = 2.8,
+        critical_distance = 1.4,
         
         # --- STOP TARGET HALLUCINATIONS ---
         detection_confidence = 0.85, # Was 0.6 (Must be 85% sure before logging a target!)
